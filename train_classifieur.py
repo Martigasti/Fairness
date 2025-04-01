@@ -1,4 +1,5 @@
 from typing import Any
+import os
 import argparse
 from torchvision.models import resnet18, ResNet18_Weights
 import torch
@@ -221,22 +222,31 @@ def get_weights(imgs, img_names, img_weights, weight=None):
     Returns the list of weights sorted in the same order as the images in the dataloader
     args:
         imgs: dataloader ordered list of tuples (image path, truth)
-        img_names: dataframe ordered list of images name
-        img_weights: dataframe ordered list of images weights
+        img_names: dataframe ordered list of image names
+        img_weights: dataframe ordered list of image weights
     """
     sorted_weights = []
-    if not (weight is None):
+
+    if weight is not None:
         for img_path, target in imgs:
             sorted_weights.append(weight[target])
     else:
-        for img_path, _ in imgs:
-            for idx, val in enumerate(img_names):
-                if val == img_path.split("/")[-1]:
-                    sorted_weights.append(img_weights[idx])
-                    break
+        # Create a mapping from image names to weights for faster lookup
+        name_to_weight = dict(zip(img_names, img_weights))
 
+        # Iterate over the images and assign weights based on img_name
+        for img_path, _ in imgs:
+            img_name = os.path.basename(img_path)  # Using os.path.basename to handle path separator
+            print(img_name)
+            if img_name in name_to_weight:
+                sorted_weights.append(name_to_weight[img_name])
+            else:
+                sorted_weights.append(1.0)  # Default weight if name is not found
+
+    # Convert weights to a tensor of type double (float64)
     sorted_weights = torch.Tensor(sorted_weights)
     sorted_weights = sorted_weights.double()
+
     return sorted_weights
 
 
@@ -247,15 +257,24 @@ def get_class_weights(imgs):
     )
     return 1.0 / train_class_sample_count
 
-
-def preds_todf(df, dataset, label_decoder, model, preds_col):
-    for idx in range(len(dataset.imgs)):
-        img_name = dataset.imgs[idx][0].split("/")[-1]
+def preds_todf(df, dataset, label_decoder, model, preds_col, device):
+    for idx in range(len(dataset)):
+        img_name = os.path.basename(dataset.imgs[idx][0])
         img, label = dataset.__getitem__(idx)
-        pred = model((img.unsqueeze(0), torch.Tensor([label])))
-        pred = pred.max(1)[1].detach().cpu().item()
+
+        # Move image and label to the same device as the model
+        img = img.to(device)  # Move img to GPU or CPU depending on availability
+        label = torch.Tensor([label]).to(device)  # Ensure label is on the correct device
+
+        # Make the prediction
+        pred = model((img.unsqueeze(0), label))
+        pred = pred.max(1)[1].detach().cpu().item()  # Get the predicted class
+
+        label_scalar = label.item()
+
         df.loc[df["Image Index"] == img_name, preds_col] = label_decoder[pred]
-        df.loc[df["Image Index"] == img_name, "labels"] = label_decoder[label]
+        df.loc[df["Image Index"] == img_name, "labels"] = label_decoder[label_scalar]
+
     return df
 
 
@@ -271,26 +290,35 @@ def pred_classifier(
         - csv_out, str: The path to the metadata csv output file, with "label" and preds_col added
         - preds_col, str : The name of the column of the csv output file, that contains the predictions per instance
     """
-    train_datadir = f"{datadir}/train/"
-    valid_datadir = f"{datadir}/valid/"
+    train_datadir = os.path.join(datadir, "train")
+    valid_datadir = os.path.join(datadir, "valid")
     train_dataset = ImageFolder(train_datadir, transform=transforms_valid)
     label_encoder = train_dataset.class_to_idx
     label_decoder = {}
     for k, v in label_encoder.items():
         label_decoder[v] = k
+
+    # Load model and move it to GPU if available
     model = ChestXRayClassifier(adamax=True, cosine=True, nb_classes=len(label_encoder))
     model.load_state_dict(torch.load(ckpt_path, map_location="cpu")["state_dict"])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)  # Move model to GPU if available, else keep it on CPU
     model.eval()
+
     val_dataset = ImageFolder(valid_datadir, transform=transforms_valid)
     df = pd.read_csv(csv_in)
     df[preds_col] = None
+
     print("Start prediction on train dataset")
     t = time()
-    df = preds_todf(df, train_dataset, label_decoder, model, preds_col)
-    print(f"Predictions done in {time()-t}")
+    # Make sure images are moved to the correct device (GPU or CPU)
+    df = preds_todf(df, train_dataset, label_decoder, model, preds_col, device)
+    print(f"Predictions done in {time()-t} seconds")
+
     print("Start prediction on validation dataset")
-    df = preds_todf(df, val_dataset, label_decoder, model, preds_col)
-    print(f"Predictions done in {time()-t}")
+    df = preds_todf(df, val_dataset, label_decoder, model, preds_col, device)
+    print(f"Predictions done in {time()-t} seconds")
+
     df.to_csv(csv_out, index=False)
     print(balanced_accuracy_score(df.labels, df[preds_col]))
     print(accuracy_score(df.labels, df[preds_col]))
@@ -316,12 +344,15 @@ def train_classifier(
 
     """
     t = time()
-    train_datadir = f"{datadir}/train/"
-    valid_datadir = f"{datadir}/valid/"
+    train_datadir = os.path.join(datadir, "train")
+    valid_datadir = os.path.join(datadir, "valid")
     df = pd.read_csv(csv)
-    logger = TensorBoardLogger(f"{logdir}/", name="classifier")
+    print(df.columns)
+
+    #Removed / adter logdir
+    logger = TensorBoardLogger(logdir, name="classifier")
     cb_ckpt_best = ModelCheckpoint(
-        dirpath=f"{logdir}/",
+        dirpath= logdir,
         monitor="val_loss",
         filename="best-val-loss",
         mode="min",
@@ -336,15 +367,26 @@ def train_classifier(
     val_dataset = ImageFolder(valid_datadir, transform=transforms_valid)
     train_weights = get_weights(train_dataset.imgs, df["Image Index"], df[weights_col])
     valid_weights = get_weights(val_dataset.imgs, df["Image Index"], df[weights_col])
+
+    #DEBUG
+    print(len(train_weights))
+    print(len(valid_weights))
+
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=32,
+        batch_size=64,
         sampler=WeightedRandomSampler(train_weights, len(train_weights)),
+        num_workers = 5,
+        persistent_workers=True,
+        pin_memory=True
     )
     val_dataloader = DataLoader(
         val_dataset,
-        batch_size=32,
+        batch_size=64,
         sampler=WeightedRandomSampler(valid_weights, len(valid_weights)),
+        num_workers = 5,
+        persistent_workers=True,
+        pin_memory=True
     )
     model = ChestXRayClassifier(adamax=True, cosine=True, nb_classes=len(label_encoder))
     print(f"Start training")
@@ -352,6 +394,7 @@ def train_classifier(
         model=model,
         train_dataloaders=train_dataloader,
         val_dataloaders=val_dataloader,
+        
     )
     print(f"End of training {time()-t}")
     t = time()
